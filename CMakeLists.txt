@@ -143,6 +143,3 @@ target_include_directories(
   ${KENLM_INCLUDE_DIRS}
   ${FLASHLIGHT_INCLUDE_DIRS}
 )
-
-install(TARGETS w2l DESTINATION lib)
-install(FILES w2l.h DESTINATION include)
