@@ -124,8 +124,6 @@ add_library(w2l SHARED
 
 if (USE_MKL)
     target_compile_definitions(w2l PUBLIC -DUSE_MKL)
-else()
-    target_link_libraries(w2l "-framework Accelerate")
 endif()
 
 set_target_properties(ArrayFire::afcpu PROPERTIES INTERFACE_LINK_LIBRARIES "")
@@ -133,6 +131,7 @@ target_link_libraries(w2l
     ${KENLM_LIBRARIES}
     ${IPP_LIBS}
     ${OPENMP_LIBRARIES}
+    "-framework Accelerate"
     ArrayFire::afcpu
     flashlight::flashlight
     gflags
