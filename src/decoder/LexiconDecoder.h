@@ -60,7 +60,7 @@ struct LexiconDecoderState {
 
   int getToken() const {
     int16_t token = tag & 0xFF;
-    return token;
+    return token == 0xFF ? -1 : token;
   }
   void setToken(int token) {
     tag = (tag & ~0xFF) | (token & 0xFF);
@@ -68,6 +68,8 @@ struct LexiconDecoderState {
 
   int getWord() const {
     int32_t word = (tag & 0xFFFFFE00);
+    if (word == 0xFFFFFE00)
+        return -1;
     return word >> 9;
   }
   void setWord(int word) {
