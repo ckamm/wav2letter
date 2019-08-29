@@ -41,13 +41,12 @@ public:
 
 class Emission {
 public:
-    Emission(EngineBase *engine, fl::Variable emission) {
-        this->engine = engine;
+    Emission(fl::Variable emission) {
         this->emission = emission;
     }
     ~Emission() {}
 
-    char *text() {
+    char *text(EngineBase *engine) {
         auto tokenPrediction =
             afToVector<int>(engine->criterion->viterbiPath(emission.array()));
         auto letters = tknPrediction2Ltr(tokenPrediction, engine->tokenDict);
@@ -59,7 +58,6 @@ public:
         return strdup("");
     }
 
-    EngineBase *engine;
     fl::Variable emission;
 };
 
@@ -88,7 +86,7 @@ public:
         auto feat = featurize({data}, {});
         auto input = af::array(feat.inputDims, feat.input.data());
         auto rawEmission = network->forward({fl::input(input)}).front();
-        return new Emission(this, rawEmission);
+        return new Emission(rawEmission);
     }
 
     bool exportModel(const char *path) {
@@ -288,8 +286,8 @@ public:
         std::vector<float> score;
         std::vector<std::vector<int>> wordPredictions;
         std::vector<std::vector<int>> letterPredictions;
-        //auto result = decoder->normal(emissionVec.data(), T, N);
-        return decoder->groupThreading(emissionVec.data(), T, N);
+        return decoder->normal(emissionVec.data(), T, N);
+        //return decoder->groupThreading(emissionVec.data(), T, N);
     }
 
     char *resultWords(const DecodeResult &result) {
@@ -349,12 +347,19 @@ void w2l_engine_free(w2l_engine *engine) {
         delete reinterpret_cast<Engine *>(engine);
 }
 
-char *w2l_emission_text(w2l_emission *emission) {
-    // TODO: I think w2l_emission needs a pointer to the criterion to do viterbiPath
-    //       I could just use a shared_ptr to just the criterion and not point emission -> engine
-    //       so I'm not passing a raw shared_ptr back from C the api
-    // TODO: do a viterbiPath here
-    return reinterpret_cast<Emission *>(emission)->text();
+char *w2l_emission_text(w2l_engine *engine, w2l_emission *emission) {
+    return reinterpret_cast<Emission *>(emission)->text(reinterpret_cast<Engine *>(engine));
+}
+
+float *w2l_emission_values(w2l_emission *emission, int *frames, int *tokens) {
+    auto em = reinterpret_cast<Emission *>(emission);
+    auto data = afToVector<float>(em->emission.array());
+    *frames = em->emission.array().dims(1);
+    *tokens = em->emission.array().dims(0);
+    int datasize = sizeof(float) * *frames * *tokens;
+    float *out = static_cast<float *>(malloc(datasize));
+    memcpy(out, data.data(), datasize);
+    return out;
 }
 
 void w2l_emission_free(w2l_emission *emission) {
