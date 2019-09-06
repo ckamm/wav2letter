@@ -312,7 +312,7 @@ public:
             LOG(FATAL) << "[Decoder] Invalid model type: " << engine->criterionType;
         }
         // FIXME, don't use global flags
-        DecoderOptions decoderOpt(
+        decoderOpt = DecoderOptions(
             opts->beamsize,
             opts->beamthresh,
             opts->lmweight,
@@ -384,6 +384,110 @@ public:
     int silIdx;
     CommandModel commandModel;
 };
+
+struct GrammarNode {
+    std::unordered_map<std::string, int> words;
+    std::unordered_map<int, const GrammarNode*> nextState;
+    bool dictationAllowed = false;
+
+    FlatTrie trie; // we don't need a trie, I just have one here to avoid a token based grammar
+
+    void prepare() {
+        Trie trieTmp(32, 0);
+        static std::string token_lookup("|'abcdefghijklmnopqrstuvwxyz");
+        for (auto wordLabel : words) {
+            std::vector<int> tokens;
+            for (auto c : wordLabel.first) {
+                tokens.push_back(token_lookup.find(c));
+            }
+            tokens.push_back(0); // end with sil
+            trieTmp.insert(tokens, wordLabel.second, 0);
+        }
+        trie = toFlatTrie(trieTmp.getRoot());
+    }
+};
+
+GrammarNode* makeExampleGrammar(CommandModel& model) {
+    auto root = new GrammarNode;
+    int idx = model.firstIdx;
+    for (std::string word : {"say", "air", "bat", "cap", "drum", "each", "fine", "gust", "harp", "sit",
+         "jury", "crunch", "look", "made", "near", "odd", "pit", "quench", "red", "sun",
+         "trap", "urge", "vest", "whale", "plex", "yank", "zip"}) {
+        root->words[word] = idx;
+        root->nextState[idx++] = root;
+    }
+
+    // allow all words after say, and also allow dictation
+    auto say = new GrammarNode(*root);
+    say->dictationAllowed = true;
+    root->nextState[root->words["say"]] = say;
+
+    root->prepare();
+    say->prepare();
+    return root;
+}
+
+struct CommandLM {
+    // this lm needs no context data
+};
+
+struct CommandLMState {
+    const GrammarNode *grammar;
+    const FlatTrieNode *lex; // current position in children
+
+    // used for making an unordered_set of const CommandLMState*
+    struct Hash {
+        const CommandLM &unused;
+        size_t operator()(const CommandLMState *v) const {
+            return size_t(v->grammar) ^ size_t(v->lex);
+        }
+    };
+
+    struct Equality {
+        const CommandLM &unused;
+        int operator()(const CommandLMState *v1, const CommandLMState *v2) const {
+            return v1->lex == v2->lex && v1->grammar == v2->grammar;
+        }
+    };
+
+    // Iterate over labels, calling fn with: the new State, the label index and the lm score
+    template <typename Fn>
+    void forLabels(const CommandLM &lm, Fn&& fn) const {
+        const auto n = lex->nLabel;
+        for (int i = 0; i < n; ++i) {
+            int label = lex->label(i);
+            CommandLMState it;
+            it.grammar = grammar->nextState.at(label);
+            it.lex = it.grammar->trie.getRoot();
+            fn(std::move(it), label, 1.5);
+        }
+    }
+
+    // Call finish() on the lm, like for end-of-sentence scoring
+    std::pair<CommandLMState, float> finish(const CommandLM &lm) const {
+        return {*this, 0};
+    }
+
+    float maxWordScore() const {
+        return 0;
+    }
+
+    // Iterate over children of the state, calling fn with:
+    // new State, new token index and whether the new state has children
+    template <typename Fn>
+    void forChildren(Fn&& fn) const {
+        const auto n = lex->nChildren;
+        for (int i = 0; i < n; ++i) {
+            auto nlex = lex->child(i);
+            fn(CommandLMState{grammar, nlex}, nlex->idx, nlex->nChildren > 0);
+        }
+    }
+
+    CommandLMState &actualize() {
+        return *this;
+    }
+};
+
 
 extern "C" {
 
@@ -465,8 +569,6 @@ void w2l_decoder_free(w2l_decoder *decoder) {
         delete reinterpret_cast<WrapDecoder *>(decoder);
 }
 
-
-
 char *w2l_decoder_process(w2l_engine *engine, w2l_decoder *decoder, w2l_emission *emission) {
     auto engineObj = reinterpret_cast<Engine *>(engine);
     auto decoderObj = reinterpret_cast<WrapDecoder *>(decoder);
@@ -503,9 +605,18 @@ char *w2l_decoder_process(w2l_engine *engine, w2l_decoder *decoder, w2l_emission
         afToVector<int>(engineObj->criterion->viterbiPath(rawEmission.array()));
     assert(N == viterbiToks.size());
 
-    KenFlatTrieLM::State commandState;
-    commandState.kenState = decoderObj->lm->start(0);
-    commandState.lex = commands.tries->getRoot();
+    auto rootCommand = makeExampleGrammar(commands);
+
+    auto commandDecoder = SimpleDecoder<CommandLM, CommandLMState>{
+                decoderObj->decoderOpt,
+                CommandLM{},
+                decoderObj->silIdx,
+                decoderObj->wordDict.getIndex(kUnkToken),
+                transitions};
+
+    CommandLMState commandState;
+    commandState.grammar = rootCommand;
+    commandState.lex = commandState.grammar->trie.getRoot();
     std::vector<int> languageDecode;
 
     int i = 0;
@@ -528,7 +639,7 @@ char *w2l_decoder_process(w2l_engine *engine, w2l_decoder *decoder, w2l_emission
         // now run the decode
         // TODO: will need to carry over decoder state between calls
         int decodeLen = viterbiSegEnd - viterbiSegStart;
-        auto decodeResult = decoderObj->decoder->normal(emissionVec.data() + viterbiSegStart * T, decodeLen, T, commandState);
+        auto decodeResult = commandDecoder.normal(emissionVec.data() + viterbiSegStart * T, decodeLen, T, commandState);
         auto decoderToks = decodeResult.tokens;
         decoderToks.erase(decoderToks.begin()); // initial hyp token
         std::vector<int> startSil(viterbiSegStart, 0);
@@ -597,15 +708,18 @@ char *w2l_decoder_process(w2l_engine *engine, w2l_decoder *decoder, w2l_emission
             continue;
         }
 
-        auto nextCommand = commands.nodes.find(outWord);
-        if (nextCommand == commands.nodes.end()) {
+        // if we were decoding multiple commands in one go, the decoder would
+        // update CommandLMState itself. Since we only do one command at a time,
+        // we need to manually update the next start state.
+        auto nextCommand = commandState.grammar->nextState.find(outWord);
+        if (nextCommand == commandState.grammar->nextState.end()) {
             std::cout << "command next step while decoding" << std::endl;
             continue;
         }
+        commandState.grammar = nextCommand->second;
+        commandState.lex = nextCommand->second->trie.getRoot();
 
-        commandState.lex = nextCommand->second.next;
-
-        if (nextCommand->second.allowLanguage) {
+        if (commandState.grammar->dictationAllowed) {
             // do a language decode and store the results
             KenFlatTrieLM::State langStartState;
             langStartState.kenState = decoderObj->lm->start(0);

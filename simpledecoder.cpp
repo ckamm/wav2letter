@@ -373,7 +373,7 @@ auto BeamSearch<LM, LMStateType>::run(
 
             const float prevMaxScore = prevLmState.maxWordScore();
             /* (1) Try children */
-            prevLmState.forChildren([&, prevIdx, prevMaxScore](typename LMStateType::Proxy lmState, int n, bool hasChildren) {
+            prevLmState.forChildren([&, prevIdx, prevMaxScore](auto lmState, int n, bool hasChildren) {
                 if (n == prevIdx)
                     hadIdenticalChild = true;
                 float score = prevHyp.score + emissions[frame * nTokens_ + n];
