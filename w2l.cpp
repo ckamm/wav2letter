@@ -427,44 +427,136 @@ GrammarNode* makeExampleGrammar(CommandModel& model) {
     return root;
 }
 
-struct CommandLM {
-    // this lm needs no context data
+namespace TCLM {
+
+std::string tokens = "|'abcdefghijklmnopqrstuvwxyz";
+const int TOKENS = 28;
+std::vector<uint8_t> charToToken(128);
+uint32_t EDGE_INIT[TOKENS] = {0};
+
+enum {
+    FLAG_NONE  = 0,
+    FLAG_START = 1,
+    FLAG_TERM  = 2,
+    FLAG_LM    = 4,
 };
 
-struct CommandLMState {
-    const GrammarNode *grammar;
-    const FlatTrieNode *lex; // current position in children
+struct cfg {
+    cfg(uint8_t token, uint8_t flags) {
+        this->token = token;
+        this->flags = flags;
+        memset(this->edges, 0, sizeof(this->edges));
+    }
 
-    // used for making an unordered_set of const CommandLMState*
+    uint8_t flags;
+    uint8_t token;
+    uint32_t edges[TOKENS];
+};
+
+class cfg_node {
+public:
+    cfg_node(std::deque<cfg> *_flat, uint32_t _idx) {
+        flat = _flat;
+        node = &flat->at(_idx);
+        idx = _idx;
+    }
+
+    void add_edge(char token, uint32_t idx) {
+        node->edges[token] = idx;
+    }
+
+    void mark_terminal() {
+        node->flags |= FLAG_TERM;
+    }
+
+    void mark_lm() {
+        node->flags |= FLAG_LM;
+    }
+
+    cfg_node link(char c) {
+        uint32_t idx = flat->size();
+        uint8_t token = charToToken[c];
+        flat->emplace_back(cfg(token, 0));
+        node->edges[token] = idx;
+        return {flat, idx};
+    }
+
+    cfg_node link(std::string word) {
+        cfg_node prev = *this;
+        for (auto &c : word) {
+            prev = prev.link(c);
+        }
+        prev = prev.link('|');
+        return prev;
+    }
+
+    void link(std::string word, const cfg_node &next) {
+        cfg_node prev = *this;
+        for (auto &c : word) {
+            prev = prev.link(c);
+        }
+        prev.node->edges[0] = next.idx;
+    }
+
+    std::string repr() {
+        std::stringstream ss;
+        char c = tokens[node->token];
+        ss << "{" << idx;
+        if (idx == 0) {
+            ss << " (null)";
+        } else if (node->flags & FLAG_START) {
+            ss << " START";
+        } else {
+            ss << " " << c;
+        }
+
+        for (int i = 0; i < TOKENS; i++) {
+            if (node->edges[i] != 0) {
+                ss << " {" << tokens[i] << " -> " << node->edges[i] << "}";
+            }
+        }
+        ss << "}";
+        return ss.str();
+    }
+
+    std::deque<cfg> *flat;
+    cfg *node;
+    uint32_t idx;
+};
+
+struct LM {
+    std::deque<cfg> flat;
+};
+
+struct State {
+    uint32_t idx;
+
+    // used for making an unordered_set of const State*
     struct Hash {
-        const CommandLM &unused;
-        size_t operator()(const CommandLMState *v) const {
-            return size_t(v->grammar) ^ size_t(v->lex);
+        const LM &unused;
+        size_t operator()(const State *v) const {
+            return v->idx; // should probably hash
         }
     };
 
     struct Equality {
-        const CommandLM &unused;
-        int operator()(const CommandLMState *v1, const CommandLMState *v2) const {
-            return v1->lex == v2->lex && v1->grammar == v2->grammar;
+        const LM &unused;
+        int operator()(const State *v1, const State *v2) const {
+            return v1->idx == v2->idx;
         }
     };
 
     // Iterate over labels, calling fn with: the new State, the label index and the lm score
     template <typename Fn>
-    void forLabels(const CommandLM &lm, Fn&& fn) const {
-        const auto n = lex->nLabel;
-        for (int i = 0; i < n; ++i) {
-            int label = lex->label(i);
-            CommandLMState it;
-            it.grammar = grammar->nextState.at(label);
-            it.lex = it.grammar->trie.getRoot();
-            fn(std::move(it), label, 1.5);
+    void forLabels(const LM &lm, Fn&& fn) const {
+        auto &lex = lm.flat[idx];
+        if (lex.token == 0) { // word boundary at sil token
+            fn(*this, idx, 1.5);
         }
     }
 
     // Call finish() on the lm, like for end-of-sentence scoring
-    std::pair<CommandLMState, float> finish(const CommandLM &lm) const {
+    std::pair<State, float> finish(const LM &lm) const {
         return {*this, 0};
     }
 
@@ -475,19 +567,48 @@ struct CommandLMState {
     // Iterate over children of the state, calling fn with:
     // new State, new token index and whether the new state has children
     template <typename Fn>
-    void forChildren(Fn&& fn) const {
-        const auto n = lex->nChildren;
-        for (int i = 0; i < n; ++i) {
-            auto nlex = lex->child(i);
-            fn(CommandLMState{grammar, nlex}, nlex->idx, nlex->nChildren > 0);
+    void forChildren(const LM &lm, Fn&& fn) const {
+        auto &lex = lm.flat[idx];
+        for (int i = 0; i < TOKENS; ++i) {
+            auto nidx = lex.edges[i];
+            if (nidx == 0)
+                continue;
+            auto &nlex = lm.flat[nidx];
+            fn(State{nidx}, nlex.token, nlex.token != 0);
         }
     }
 
-    CommandLMState &actualize() {
+    State &actualize() {
         return *this;
     }
 };
 
+LM make() {
+    for (int i = 0; i < tokens.size(); i++) {
+        charToToken[tokens[i]] = i;
+    }
+
+    std::deque<cfg> flat;
+    flat.emplace_back(cfg(0, 0));
+    flat.emplace_back(cfg(0, FLAG_START));
+
+    cfg_node start(&flat, 1);
+    auto say = start.link("say");
+    say.mark_lm(); // TODO: word range?
+    say.mark_terminal();
+
+    auto over = say.link("over");
+    over.mark_terminal();
+
+    auto digit = start.link("digit");
+    digit.link("one").mark_terminal();
+    digit.link("two", start);
+
+    start.link("test", start);
+
+    return LM{flat};
+}
+} // namespace TCLM
 
 extern "C" {
 
@@ -605,18 +726,17 @@ char *w2l_decoder_process(w2l_engine *engine, w2l_decoder *decoder, w2l_emission
         afToVector<int>(engineObj->criterion->viterbiPath(rawEmission.array()));
     assert(N == viterbiToks.size());
 
-    auto rootCommand = makeExampleGrammar(commands);
+    auto tclm = TCLM::make();
 
-    auto commandDecoder = SimpleDecoder<CommandLM, CommandLMState>{
+    auto commandDecoder = SimpleDecoder<TCLM::LM, TCLM::State>{
                 decoderObj->decoderOpt,
-                CommandLM{},
+                tclm,
                 decoderObj->silIdx,
                 decoderObj->wordDict.getIndex(kUnkToken),
                 transitions};
 
-    CommandLMState commandState;
-    commandState.grammar = rootCommand;
-    commandState.lex = commandState.grammar->trie.getRoot();
+    TCLM::State commandState;
+    commandState.idx = 1;
     std::vector<int> languageDecode;
 
     int i = 0;
@@ -694,32 +814,26 @@ char *w2l_decoder_process(w2l_engine *engine, w2l_decoder *decoder, w2l_emission
             if (!languageDecode.empty()) {
                 for (int j = viterbiSegStart; j < i; ++j) {
                     if (languageDecode[j] != -1)
-                        std::cout << decoderObj->wordDict.getEntry(languageDecode[j]) << std::endl;
+                        std::cout << "decoded language: " << decoderObj->wordDict.getEntry(languageDecode[j]) << std::endl;
                 }
             }
 
             continue;
         }
 
-        std::cout << decoderObj->wordDict.getEntry(outWord) << std::endl;
-
-        if (outWord < commands.firstIdx) {
-            std::cout << "non-command while command decoding" << std::endl;
+        if (outWord >= tclm.flat.size()) {
+            std::cout << "bad decode label " << outWord << std::endl;
             continue;
         }
+
+        std::cout << "decoded command:  " << tokensToString(decoderToks, decodeWordStart, decodeWordEnd) << std::endl;
 
         // if we were decoding multiple commands in one go, the decoder would
-        // update CommandLMState itself. Since we only do one command at a time,
+        // update TCLM::State itself. Since we only do one command at a time,
         // we need to manually update the next start state.
-        auto nextCommand = commandState.grammar->nextState.find(outWord);
-        if (nextCommand == commandState.grammar->nextState.end()) {
-            std::cout << "command next step while decoding" << std::endl;
-            continue;
-        }
-        commandState.grammar = nextCommand->second;
-        commandState.lex = nextCommand->second->trie.getRoot();
+        commandState.idx = outWord;
 
-        if (commandState.grammar->dictationAllowed) {
+        if (tclm.flat[outWord].flags & TCLM::FLAG_LM) {
             // do a language decode and store the results
             KenFlatTrieLM::State langStartState;
             langStartState.kenState = decoderObj->lm->start(0);
@@ -728,6 +842,8 @@ char *w2l_decoder_process(w2l_engine *engine, w2l_decoder *decoder, w2l_emission
             languageDecode = std::vector<int>(i, 0);
             languageDecode.insert(languageDecode.end(), languageResult.words.begin() + 1, languageResult.words.end());
             //std::cout << "lang decode: " << tokensToString(languageResult.tokens, 1, languageResult.tokens.size() - 1) << std::endl;
+        } else if (tclm.flat[outWord].flags & TCLM::FLAG_TERM) {
+            break;
         } else {
             languageDecode.clear();
         }
