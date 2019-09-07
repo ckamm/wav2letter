@@ -80,7 +80,7 @@ namespace KenFlatTrieLM {
         // Iterate over children of the state, calling fn with:
         // new State (or a Proxy), new token index and whether the new state has children
         template <typename Fn>
-        void forChildren(const LM &lm, Fn&& fn) const {
+        void forChildren(int frame, const LM &lm, Fn&& fn) const {
             const auto n = lex->nChildren;
             for (int i = 0; i < n; ++i) {
                 auto nlex = lex->child(i);
@@ -373,7 +373,7 @@ auto BeamSearch<LM, LMStateType>::run(
 
             const float prevMaxScore = prevLmState.maxWordScore();
             /* (1) Try children */
-            prevLmState.forChildren(lm_, [&, prevIdx, prevMaxScore](auto lmState, int n, bool hasChildren) {
+            prevLmState.forChildren(t, lm_, [&, prevIdx, prevMaxScore](auto lmState, int n, bool hasChildren) {
                 if (n == prevIdx)
                     hadIdenticalChild = true;
                 float score = prevHyp.score + emissions[frame * nTokens_ + n];

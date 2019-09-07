@@ -526,6 +526,7 @@ public:
 
 struct LM {
     std::deque<cfg> flat;
+    int wordStartsBefore = 1000000000;
 };
 
 struct State {
@@ -567,8 +568,10 @@ struct State {
     // Iterate over children of the state, calling fn with:
     // new State, new token index and whether the new state has children
     template <typename Fn>
-    void forChildren(const LM &lm, Fn&& fn) const {
+    void forChildren(int frame, const LM &lm, Fn&& fn) const {
         auto &lex = lm.flat[idx];
+        if (lex.token == 0 && frame >= lm.wordStartsBefore)
+            return;
         for (int i = 0; i < TOKENS; ++i) {
             auto nidx = lex.edges[i];
             if (nidx == 0)
@@ -701,19 +704,50 @@ char *w2l_decoder_process(w2l_engine *engine, w2l_decoder *decoder, w2l_emission
     int N = rawEmission.dims(1);
     auto transitions = afToVector<float>(engineObj->criterion->param(0).array());
 
-    auto emissionTransmissionScore = [&emissionVec, &transitions, T](const std::vector<int> &tokens, int from, int to) {
+    auto emissionTransmissionAdjustment = [&emissionVec, &transitions, T](const std::vector<int> &tokens, int from, int i) {
+        float score = 0;
+        if (i > from) {
+            score += transitions[tokens[i] * T + tokens[i - 1]];
+        } else {
+            score += transitions[tokens[i] * T + 0]; // from silence
+        }
+        score += emissionVec[i * T + tokens[i]];
+        return score;
+    };
+
+    auto emissionTransmissionScore = [&emissionTransmissionAdjustment, &transitions, T](const std::vector<int> &tokens, int from, int to) {
         float score = 0.0;
         for (int i = from; i < to; ++i) {
-            if (i > from) {
-                score += transitions[tokens[i] * T + tokens[i - 1]];
-            } else {
-                score += transitions[tokens[i] * T + 0]; // from silence
-            }
-            score += emissionVec[i * T + tokens[i]];
+            score += emissionTransmissionAdjustment(tokens, from, i);
         }
         score += transitions[0 * T + tokens[to - 1]]; // to silence
         return score;
     };
+
+    auto worstEmissionTransmissionWindowFraction = [&emissionTransmissionAdjustment, &transitions, T](
+            const std::vector<int> &tokens1,
+            const std::vector<int> &tokens2,
+            int from, int to, int window) {
+        float score1 = 0.0;
+        float score2 = 0.0;
+        float worst = INFINITY;
+        for (int i = from; i < to; ++i) {
+            score1 += emissionTransmissionAdjustment(tokens1, from, i);
+            score2 += emissionTransmissionAdjustment(tokens2, from, i);
+            if (i < from + window)
+                continue;
+            if (worst > score1 / score2)
+                worst = score1 / score2;
+            score1 -= emissionTransmissionAdjustment(tokens1, from, i - window);
+            score2 -= emissionTransmissionAdjustment(tokens2, from, i - window);
+        }
+        score1 += transitions[0 * T + tokens1[to - 1]]; // to silence
+        score2 += transitions[0 * T + tokens2[to - 1]]; // to silence
+        if (worst > score1 / score2)
+            worst = score1 / score2;
+        return worst;
+    };
+
 
     auto tokensToString = [engineObj](const std::vector<int> &tokens, int from, int to) {
         std::string out;
@@ -728,8 +762,15 @@ char *w2l_decoder_process(w2l_engine *engine, w2l_decoder *decoder, w2l_emission
 
     auto tclm = TCLM::make();
 
+    // an increased silWeight avoids "token tragging" like here:
+    // decoder: ||||||||ooooooooooooooooooooovvveerrr
+    // viterbi: hheellllloooo||||||||||||oooovvveerrr
+    auto commandDecoderOpt = decoderObj->decoderOpt;
+    commandDecoderOpt.silWeight = 0.5;
+    // possibly the silweight needs to be aaccounted for in em-tr-scores?
+
     auto commandDecoder = SimpleDecoder<TCLM::LM, TCLM::State>{
-                decoderObj->decoderOpt,
+                commandDecoderOpt,
                 tclm,
                 decoderObj->silIdx,
                 decoderObj->wordDict.getIndex(kUnkToken),
@@ -744,21 +785,16 @@ char *w2l_decoder_process(w2l_engine *engine, w2l_decoder *decoder, w2l_emission
         int viterbiSegStart = i;
         while (i < N && viterbiToks[i] == 0)
             ++i;
-
         int viterbiWordStart = i;
         while (i < N && viterbiToks[i] != 0)
             ++i;
         int viterbiWordEnd = i;
         // it's ok if wordStart == wordEnd, maybe the decoder sees something
 
-        while (i < N && viterbiToks[i] == 0)
-            ++i;
-        int viterbiSegEnd = i;
-
-        // we now know the whole viterbi segment as well as where the word is
-        // now run the decode
-        // TODO: will need to carry over decoder state between calls
-        int decodeLen = viterbiSegEnd - viterbiSegStart;
+        // in the future we could stop the decode after one word instead of
+        // decoding everything
+        int decodeLen = N - viterbiSegStart;
+        commandDecoder.lm_.wordStartsBefore = viterbiWordEnd - viterbiSegStart;
         auto decodeResult = commandDecoder.normal(emissionVec.data() + viterbiSegStart * T, decodeLen, T, commandState);
         auto decoderToks = decodeResult.tokens;
         decoderToks.erase(decoderToks.begin()); // initial hyp token
@@ -769,7 +805,6 @@ char *w2l_decoder_process(w2l_engine *engine, w2l_decoder *decoder, w2l_emission
         int j = 0;
         while (j < decodeLen && decoderToks[j] == 0)
             ++j;
-
         int decodeWordStart = j;
         while (j < decodeLen && decoderToks[j] != 0)
             ++j;
@@ -777,47 +812,50 @@ char *w2l_decoder_process(w2l_engine *engine, w2l_decoder *decoder, w2l_emission
         // Again it's ok if wordStart == wordEnd, need to process anyway.
         // Maybe we are in language mode and need to emit those words?
 
-        // we score the maximum range of the two non-silence areas
+        // we score the decoded word plus any adjacent non-sil viterbi tokens
+        // - at least until the next decoded command word start
         int scoreWordStart = std::min(viterbiWordStart, decodeWordStart);
-        int scoreWordEnd = std::max(viterbiWordEnd, decodeWordEnd);
-        if (viterbiWordStart == viterbiWordEnd) {
-            scoreWordStart = decodeWordStart;
-            scoreWordEnd = decodeWordEnd;
-        }
-        if (decodeWordStart == decodeWordEnd) {
-            scoreWordStart = viterbiWordStart;
-            scoreWordEnd = viterbiWordEnd;
-        }
+        int scoreWordEnd = decodeWordEnd;
+        while (scoreWordEnd < N && viterbiToks[scoreWordEnd] != 0 && decoderToks[scoreWordEnd] == 0)
+            ++scoreWordEnd;
 
-        i = std::min(scoreWordEnd + 2, N);
-        //std::cout << viterbiSegStart << " " << i << " " << viterbiSegEnd << std::endl;
+        // if the decoder didn't see anything, only discard the area where we allowed
+        // words to start.
+        if (decodeWordStart == decodeWordEnd)
+            scoreWordEnd = viterbiWordEnd;
+
+        i = std::min(scoreWordEnd, N);
 
         // the criterion for rejecting decodes is the decode-score / viterbi-score
         // where the score is the emission-transmission score
         float viterbiScore = emissionTransmissionScore(viterbiToks, scoreWordStart, scoreWordEnd);
         float decoderScore = emissionTransmissionScore(decoderToks, scoreWordStart, scoreWordEnd);
+        float windowFrac = worstEmissionTransmissionWindowFraction(decoderToks, viterbiToks, scoreWordStart, scoreWordEnd, 8);
 
-//        std::cout << "decoder: " << tokensToString(decoderToks, scoreWordStart, scoreWordEnd) << std::endl
-//                  << "viterbi: " << tokensToString(viterbiToks, scoreWordStart, scoreWordEnd) << std::endl
-//                  << "scores: " << decoderScore << " " << viterbiScore << " " << decoderScore / viterbiScore << std::endl;
+        std::cout << "decoder: " << tokensToString(decoderToks, scoreWordStart, scoreWordEnd) << std::endl
+                  << "viterbi: " << tokensToString(viterbiToks, scoreWordStart, scoreWordEnd) << std::endl
+                  << "scores: " << decoderScore << " " << viterbiScore << " " << decoderScore / viterbiScore << " " << windowFrac << std::endl;
 
         // find the recognized word index
         int outWord = -1;
         // word decode is only written in first silence *after* the word
-        for (int j = scoreWordStart; j < std::min(i, viterbiSegEnd); ++j) {
+        for (int j = scoreWordStart; j < std::max(decodeWordEnd + 1, scoreWordEnd); ++j) {
             outWord = decodeResult.words[1 + j - viterbiSegStart]; // +1 because of initial hyp
             if (outWord != -1)
                 break;
         }
-        if (decoderScore / viterbiScore < 0.9 || outWord == -1) {
-            // While in language mode, emit language words if there is no command
-            if (!languageDecode.empty()) {
-                for (int j = viterbiSegStart; j < i; ++j) {
-                    if (languageDecode[j] != -1)
-                        std::cout << "decoded language: " << decoderObj->wordDict.getEntry(languageDecode[j]) << std::endl;
-                }
-            }
 
+        bool goodCommand = windowFrac > 0.85 && outWord != -1;
+
+        // While in language mode, emit language words up to the command
+        if (!languageDecode.empty()) {
+            for (int j = viterbiSegStart; j < (goodCommand ? decodeWordStart : i); ++j) {
+                if (languageDecode[j] != -1)
+                    std::cout << "decoded language: " << decoderObj->wordDict.getEntry(languageDecode[j]) << std::endl;
+            }
+        }
+
+        if (!goodCommand) {
             continue;
         }
 
