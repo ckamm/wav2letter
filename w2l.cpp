@@ -203,6 +203,18 @@ private:
     }
 };
 
+DecoderOptions toW2lDecoderOptions(const w2l_decode_options &opts) {
+    return DecoderOptions(
+                opts.beamsize,
+                opts.beamthresh,
+                opts.lmweight,
+                opts.wordscore,
+                opts.unkweight,
+                opts.logadd,
+                opts.silweight,
+                CriterionType::ASG);
+}
+
 class WrapDecoder {
 public:
     WrapDecoder(Engine *engine, const char *languageModelPath, const char *lexiconPath, const w2l_decode_options *opts) {
@@ -212,19 +224,6 @@ public:
         auto lexicon = loadWords(lexiconPath, -1);
         wordDict = createWordDict(lexicon);
         lm = std::make_shared<KenLM>(languageModelPath, wordDict);
-
-        // build an ad-hoc command lexicon based on the spellings in the real lexicon
-        size_t firstCommandIdx = wordDict.indexSize();
-        LexiconMap commandLexicon;
-        for (auto command : {"say", "air", "bat", "cap", "drum", "each", "fine", "gust", "harp", "sit",
-                             "jury", "crunch", "look", "made", "near", "odd", "pit", "quench", "red", "sun",
-                             "trap", "urge", "vest", "whale", "plex", "yank", "zip"}) {
-            std::string commandWord = std::string("COMMAND(") + command + ")";
-            std::vector<std::string> spelling = lexicon[command][0];
-            std::cout << commandWord << std::endl;
-            commandLexicon[commandWord] = {spelling};
-            wordDict.addEntry(commandWord);
-        }
 
         // Load the trie: either the flattened cache from disk, or recreate from the lexicon
         std::string flatTriePath = std::string(lexiconPath) + ".flattrie";
@@ -281,29 +280,6 @@ public:
         // the root maxScore should be 0 during search and it's more convenient to set here
         const_cast<FlatTrieNode *>(flatTrie->getRoot())->maxScore = 0;
 
-        // Build the command trie - if there was a real grammar there would be multiple roots
-        std::shared_ptr<Trie> commandTrie = std::make_shared<Trie>(engine->tokenDict.indexSize(), silIdx);
-        for (auto& it : commandLexicon) {
-            const std::string& word = it.first;
-            int usrIdx = wordDict.getIndex(word);
-            for (auto& tokens : it.second) {
-                auto tokensTensor = tkn2Idx(tokens, engine->tokenDict);
-                commandTrie->insert(tokensTensor, usrIdx, 0.0);
-            }
-        }
-        commandTrie->smear(SmearingMode::MAX);
-        auto flatCommandTrie = std::make_shared<FlatTrie>(toFlatTrie(commandTrie->getRoot()));
-
-        commandModel = CommandModel{
-            .firstIdx = firstCommandIdx,
-            .tries = flatCommandTrie,
-        };
-        for (auto& it : commandLexicon) {
-            commandModel.nodes[wordDict.getIndex(it.first)] = { false, flatCommandTrie->getRoot() }; // just allow more commands after commands
-        }
-        commandModel.nodes[wordDict.getIndex("COMMAND(say)")].allowLanguage = true;
-
-
         CriterionType criterionType = CriterionType::ASG;
         if (engine->criterionType == kCtcCriterion) {
             criterionType = CriterionType::CTC;
@@ -311,21 +287,11 @@ public:
             // FIXME:
             LOG(FATAL) << "[Decoder] Invalid model type: " << engine->criterionType;
         }
-        // FIXME, don't use global flags
-        decoderOpt = DecoderOptions(
-            opts->beamsize,
-            opts->beamthresh,
-            opts->lmweight,
-            opts->wordscore,
-            opts->unkweight,
-            opts->logadd,
-            opts->silweight,
-            criterionType);
+        decoderOpt = toW2lDecoderOptions(*opts);
 
         KenFlatTrieLM::LM lmWrap;
         lmWrap.ken = lm;
         lmWrap.trie = flatTrie;
-        lmWrap.firstCommandLabel = firstCommandIdx;
 
         auto transition = afToVector<float>(engine->criterion->param(0).array());
         decoder.reset(new SimpleDecoder<KenFlatTrieLM::LM, KenFlatTrieLM::State>{
@@ -382,52 +348,9 @@ public:
     Dictionary tokenDict;
     DecoderOptions decoderOpt;
     int silIdx;
-    CommandModel commandModel;
 };
 
-struct GrammarNode {
-    std::unordered_map<std::string, int> words;
-    std::unordered_map<int, const GrammarNode*> nextState;
-    bool dictationAllowed = false;
-
-    FlatTrie trie; // we don't need a trie, I just have one here to avoid a token based grammar
-
-    void prepare() {
-        Trie trieTmp(32, 0);
-        static std::string token_lookup("|'abcdefghijklmnopqrstuvwxyz");
-        for (auto wordLabel : words) {
-            std::vector<int> tokens;
-            for (auto c : wordLabel.first) {
-                tokens.push_back(token_lookup.find(c));
-            }
-            tokens.push_back(0); // end with sil
-            trieTmp.insert(tokens, wordLabel.second, 0);
-        }
-        trie = toFlatTrie(trieTmp.getRoot());
-    }
-};
-
-GrammarNode* makeExampleGrammar(CommandModel& model) {
-    auto root = new GrammarNode;
-    int idx = model.firstIdx;
-    for (std::string word : {"say", "air", "bat", "cap", "drum", "each", "fine", "gust", "harp", "sit",
-         "jury", "crunch", "look", "made", "near", "odd", "pit", "quench", "red", "sun",
-         "trap", "urge", "vest", "whale", "plex", "yank", "zip"}) {
-        root->words[word] = idx;
-        root->nextState[idx++] = root;
-    }
-
-    // allow all words after say, and also allow dictation
-    auto say = new GrammarNode(*root);
-    say->dictationAllowed = true;
-    root->nextState[root->words["say"]] = say;
-
-    root->prepare();
-    say->prepare();
-    return root;
-}
-
-namespace TCLM {
+namespace DFALM {
 
 std::string tokens = "|'abcdefghijklmnopqrstuvwxyz";
 const int TOKENS = 28;
@@ -441,91 +364,11 @@ enum {
     FLAG_LM    = 4,
 };
 
-struct cfg {
-    cfg(uint8_t token, uint8_t flags) {
-        this->token = token;
-        this->flags = flags;
-        memset(this->edges, 0, sizeof(this->edges));
-    }
-
-    uint8_t flags;
-    uint8_t token;
-    uint32_t edges[TOKENS];
-};
-
-class cfg_node {
-public:
-    cfg_node(std::deque<cfg> *_flat, uint32_t _idx) {
-        flat = _flat;
-        node = &flat->at(_idx);
-        idx = _idx;
-    }
-
-    void add_edge(char token, uint32_t idx) {
-        node->edges[token] = idx;
-    }
-
-    void mark_terminal() {
-        node->flags |= FLAG_TERM;
-    }
-
-    void mark_lm() {
-        node->flags |= FLAG_LM;
-    }
-
-    cfg_node link(char c) {
-        uint32_t idx = flat->size();
-        uint8_t token = charToToken[c];
-        flat->emplace_back(cfg(token, 0));
-        node->edges[token] = idx;
-        return {flat, idx};
-    }
-
-    cfg_node link(std::string word) {
-        cfg_node prev = *this;
-        for (auto &c : word) {
-            prev = prev.link(c);
-        }
-        prev = prev.link('|');
-        return prev;
-    }
-
-    void link(std::string word, const cfg_node &next) {
-        cfg_node prev = *this;
-        for (auto &c : word) {
-            prev = prev.link(c);
-        }
-        prev.node->edges[0] = next.idx;
-    }
-
-    std::string repr() {
-        std::stringstream ss;
-        char c = tokens[node->token];
-        ss << "{" << idx;
-        if (idx == 0) {
-            ss << " (null)";
-        } else if (node->flags & FLAG_START) {
-            ss << " START";
-        } else {
-            ss << " " << c;
-        }
-
-        for (int i = 0; i < TOKENS; i++) {
-            if (node->edges[i] != 0) {
-                ss << " {" << tokens[i] << " -> " << node->edges[i] << "}";
-            }
-        }
-        ss << "}";
-        return ss.str();
-    }
-
-    std::deque<cfg> *flat;
-    cfg *node;
-    uint32_t idx;
-};
-
 struct LM {
-    std::deque<cfg> flat;
+    const cfg *dfa;
+    const cfg *get(const uint32_t idx) const {
+        return reinterpret_cast<const cfg *>(reinterpret_cast<const uint8_t *>(dfa) + idx);
+    }
     int wordStartsBefore = 1000000000;
 };
 
@@ -536,7 +379,7 @@ struct State {
     struct Hash {
         const LM &unused;
         size_t operator()(const State *v) const {
-            return v->idx; // should probably hash
+            return std::hash<uint32_t>()(v->idx);
         }
     };
 
@@ -550,9 +393,10 @@ struct State {
     // Iterate over labels, calling fn with: the new State, the label index and the lm score
     template <typename Fn>
     void forLabels(const LM &lm, Fn&& fn) const {
-        auto &lex = lm.flat[idx];
+        auto &lex = *lm.get(idx);
+        const float commandScore = 1.5;
         if (lex.token == 0) { // word boundary at sil token
-            fn(*this, idx, 1.5);
+            fn(*this, idx, commandScore);
         }
     }
 
@@ -562,21 +406,19 @@ struct State {
     }
 
     float maxWordScore() const {
-        return 0;
+        return 0; // could control whether the beam search gets scores before finishing commands
     }
 
     // Iterate over children of the state, calling fn with:
     // new State, new token index and whether the new state has children
     template <typename Fn>
     void forChildren(int frame, const LM &lm, Fn&& fn) const {
-        auto &lex = lm.flat[idx];
+        auto &lex = *lm.get(idx);
         if (lex.token == 0 && frame >= lm.wordStartsBefore)
             return;
-        for (int i = 0; i < TOKENS; ++i) {
+        for (int i = 0; i < lex.nEdges; ++i) {
             auto nidx = lex.edges[i];
-            if (nidx == 0)
-                continue;
-            auto &nlex = lm.flat[nidx];
+            auto &nlex = *lm.get(nidx);
             fn(State{nidx}, nlex.token, nlex.token != 0);
         }
     }
@@ -586,32 +428,7 @@ struct State {
     }
 };
 
-LM make() {
-    for (int i = 0; i < tokens.size(); i++) {
-        charToToken[tokens[i]] = i;
-    }
-
-    std::deque<cfg> flat;
-    flat.emplace_back(cfg(0, 0));
-    flat.emplace_back(cfg(0, FLAG_START));
-
-    cfg_node start(&flat, 1);
-    auto say = start.link("say");
-    say.mark_lm(); // TODO: word range?
-    say.mark_terminal();
-
-    auto over = say.link("over");
-    over.mark_terminal();
-
-    auto digit = start.link("digit");
-    digit.link("one").mark_terminal();
-    digit.link("two", start);
-
-    start.link("test", start);
-
-    return LM{flat};
-}
-} // namespace TCLM
+} // namespace DFALM
 
 extern "C" {
 
@@ -693,16 +510,15 @@ void w2l_decoder_free(w2l_decoder *decoder) {
         delete reinterpret_cast<WrapDecoder *>(decoder);
 }
 
-char *w2l_decoder_process(w2l_engine *engine, w2l_decoder *decoder, w2l_emission *emission) {
+char *w2l_decoder_dfa(w2l_engine *engine, w2l_decoder *decoder, w2l_emission *emission, cfg *dfa, cmd_decode_opts opts) {
     auto engineObj = reinterpret_cast<Engine *>(engine);
     auto decoderObj = reinterpret_cast<WrapDecoder *>(decoder);
-    auto &commands = decoderObj->commandModel;
     auto rawEmission = reinterpret_cast<Emission *>(emission)->emission;
 
     auto emissionVec = afToVector<float>(rawEmission);
     int T = rawEmission.dims(0);
     int N = rawEmission.dims(1);
-    auto transitions = afToVector<float>(engineObj->criterion->param(0).array());
+    auto &transitions = decoderObj->decoder->transitions_;
 
     auto emissionTransmissionAdjustment = [&emissionVec, &transitions, T](const std::vector<int> &tokens, int from, int i) {
         float score = 0;
@@ -755,30 +571,37 @@ char *w2l_decoder_process(w2l_engine *engine, w2l_decoder *decoder, w2l_emission
             out.append(engineObj->tokenDict.getEntry(tokens[i]));
         return out;
     };
+    auto tokensToStringDedup = [engineObj](const std::vector<int> &tokens, int from, int to) {
+        std::string out;
+        int tok = -1;
+        for (int i = from; i < to; ++i) {
+            if (tok == tokens[i])
+                continue;
+            tok = tokens[i];
+            out.append(engineObj->tokenDict.getEntry(tok));
+        }
+        return out;
+    };
 
     auto viterbiToks =
         afToVector<int>(engineObj->criterion->viterbiPath(rawEmission.array()));
     assert(N == viterbiToks.size());
 
-    auto tclm = TCLM::make();
+    auto dfalm = DFALM::LM{dfa};
 
-    // an increased silWeight avoids "token tragging" like here:
-    // decoder: ||||||||ooooooooooooooooooooovvveerrr
-    // viterbi: hheellllloooo||||||||||||oooovvveerrr
-    auto commandDecoderOpt = decoderObj->decoderOpt;
-    commandDecoderOpt.silWeight = 0.5;
-    // possibly the silweight needs to be aaccounted for in em-tr-scores?
-
-    auto commandDecoder = SimpleDecoder<TCLM::LM, TCLM::State>{
-                commandDecoderOpt,
-                tclm,
+    auto commandDecoder = SimpleDecoder<DFALM::LM, DFALM::State>{
+                toW2lDecoderOptions(opts.cmdDecodeOpts),
+                dfalm,
                 decoderObj->silIdx,
                 decoderObj->wordDict.getIndex(kUnkToken),
                 transitions};
 
-    TCLM::State commandState;
-    commandState.idx = 1;
-    std::vector<int> languageDecode;
+    DFALM::State commandState;
+    commandState.idx = 0; // presumed root state of dfa
+
+    std::vector<int> languageDecode; // stores tokens of a later language decode
+
+    std::string result;
 
     int i = 0;
     while (i < N) {
@@ -826,16 +649,6 @@ char *w2l_decoder_process(w2l_engine *engine, w2l_decoder *decoder, w2l_emission
 
         i = std::min(scoreWordEnd, N);
 
-        // the criterion for rejecting decodes is the decode-score / viterbi-score
-        // where the score is the emission-transmission score
-        float viterbiScore = emissionTransmissionScore(viterbiToks, scoreWordStart, scoreWordEnd);
-        float decoderScore = emissionTransmissionScore(decoderToks, scoreWordStart, scoreWordEnd);
-        float windowFrac = worstEmissionTransmissionWindowFraction(decoderToks, viterbiToks, scoreWordStart, scoreWordEnd, 8);
-
-        std::cout << "decoder: " << tokensToString(decoderToks, scoreWordStart, scoreWordEnd) << std::endl
-                  << "viterbi: " << tokensToString(viterbiToks, scoreWordStart, scoreWordEnd) << std::endl
-                  << "scores: " << decoderScore << " " << viterbiScore << " " << decoderScore / viterbiScore << " " << windowFrac << std::endl;
-
         // find the recognized word index
         int outWord = -1;
         // word decode is only written in first silence *after* the word
@@ -845,33 +658,68 @@ char *w2l_decoder_process(w2l_engine *engine, w2l_decoder *decoder, w2l_emission
                 break;
         }
 
-        bool goodCommand = windowFrac > 0.85 && outWord != -1;
+        // the criterion for rejecting decodes is the decode-score / viterbi-score
+        // where the score is the emission-transmission score
+        float windowFrac = worstEmissionTransmissionWindowFraction(decoderToks, viterbiToks, scoreWordStart, scoreWordEnd, opts.rejectionTokenWindow);
+        bool goodCommand = windowFrac > opts.rejectionThreshold && outWord != -1;
+
+        if (opts.debug) {
+            float viterbiScore = emissionTransmissionScore(viterbiToks, scoreWordStart, scoreWordEnd);
+            float decoderScore = emissionTransmissionScore(decoderToks, scoreWordStart, scoreWordEnd);
+
+            if (outWord == -1) {
+                std::cout << "no command" << std::endl;
+            } else if (goodCommand) {
+                std::cout << "good command" << std::endl;
+            } else {
+                std::cout << "rejected command" << std::endl;
+            }
+            std::cout << "decoder: " << tokensToString(decoderToks, scoreWordStart, scoreWordEnd) << std::endl
+                      << "viterbi: " << tokensToString(viterbiToks, scoreWordStart, scoreWordEnd) << std::endl
+                      << "scores: decoder: " << decoderScore << " viterbi: " << viterbiScore << " fraction: " << decoderScore / viterbiScore << std::endl
+                      << "        worst window fraction: " << windowFrac << std::endl
+                      << std::endl;
+        }
 
         // While in language mode, emit language words up to the command
         if (!languageDecode.empty()) {
             for (int j = viterbiSegStart; j < (goodCommand ? decodeWordStart : i); ++j) {
-                if (languageDecode[j] != -1)
-                    std::cout << "decoded language: " << decoderObj->wordDict.getEntry(languageDecode[j]) << std::endl;
+                if (languageDecode[j] != -1) {
+                    if (!result.empty())
+                        result += " ";
+                    result += decoderObj->wordDict.getEntry(languageDecode[j]);
+                    if (opts.debug) {
+                        std::cout << "decoded language, new out: " << result << std::endl;
+                    }
+                }
             }
         }
 
-        if (!goodCommand) {
+        // If a command was found, output it.
+        if (goodCommand) {
+            if (!result.empty())
+                result += " ";
+            result += "@"; // command marker
+            result += tokensToStringDedup(decoderToks, decodeWordStart, decodeWordEnd);
+            if (opts.debug) {
+                std::cout << "decoded command, new out: " << result << std::endl;
+            }
+        } else {
+            if (languageDecode.empty()) {
+                // found a non-command and language mode is off
+                return nullptr;
+            }
+            // not a command but we can report whatever language we can find
             continue;
         }
-
-        if (outWord >= tclm.flat.size()) {
-            std::cout << "bad decode label " << outWord << std::endl;
-            continue;
-        }
-
-        std::cout << "decoded command:  " << tokensToString(decoderToks, decodeWordStart, decodeWordEnd) << std::endl;
 
         // if we were decoding multiple commands in one go, the decoder would
-        // update TCLM::State itself. Since we only do one command at a time,
+        // update the state itself. Since we only do one command at a time,
         // we need to manually update the next start state.
         commandState.idx = outWord;
 
-        if (tclm.flat[outWord].flags & TCLM::FLAG_LM) {
+        const auto flags = dfalm.get(outWord)->flags;
+        if (flags & DFALM::FLAG_LM) {
             // do a language decode and store the results
             KenFlatTrieLM::State langStartState;
             langStartState.kenState = decoderObj->lm->start(0);
@@ -880,13 +728,16 @@ char *w2l_decoder_process(w2l_engine *engine, w2l_decoder *decoder, w2l_emission
             languageDecode = std::vector<int>(i, 0);
             languageDecode.insert(languageDecode.end(), languageResult.words.begin() + 1, languageResult.words.end());
             //std::cout << "lang decode: " << tokensToString(languageResult.tokens, 1, languageResult.tokens.size() - 1) << std::endl;
-        } else if (tclm.flat[outWord].flags & TCLM::FLAG_TERM) {
+        } else if (flags & DFALM::FLAG_TERM) {
+            // TODO: Should reject everything if non-silence follows?
             break;
         } else {
             languageDecode.clear();
         }
     }
+    if (!result.empty())
+        return strdup(result.c_str());
+    return nullptr;
 }
-
 
 } // extern "C"

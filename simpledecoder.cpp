@@ -7,7 +7,6 @@ namespace KenFlatTrieLM {
     struct LM {
         LMPtr ken;
         FlatTriePtr trie;
-        int firstCommandLabel;
     };
 
     // Every DecoderState will store a State.
@@ -48,15 +47,11 @@ namespace KenFlatTrieLM {
                 const auto n = lex->nLabel;
                 for (int i = 0; i < n; ++i) {
                     int label = lex->label(i);
-                    if (label < lm.firstCommandLabel) {
-                        auto kenAndScore = lm.ken->score(base.kenState, label);
-                        State it;
-                        it.kenState = std::move(kenAndScore.first);
-                        it.lex = lm.trie->getRoot();
-                        fn(std::move(it), label, kenAndScore.second);
-                    } else {
-                        fn(actualize(), label, 1.5);
-                    }
+                    auto kenAndScore = lm.ken->score(base.kenState, label);
+                    State it;
+                    it.kenState = std::move(kenAndScore.first);
+                    it.lex = lm.trie->getRoot();
+                    fn(std::move(it), label, kenAndScore.second);
                 }
             }
 
