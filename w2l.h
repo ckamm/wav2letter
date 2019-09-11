@@ -49,7 +49,7 @@ typedef struct {
     uint8_t flags;
     uint8_t token;
     uint8_t nEdges;
-    uint32_t edges[1];
+    int32_t edges[1];
 } cfg;
 
 typedef struct {

@@ -366,37 +366,36 @@ enum {
 
 struct LM {
     const cfg *dfa;
-    const cfg *get(const uint32_t idx) const {
-        return reinterpret_cast<const cfg *>(reinterpret_cast<const uint8_t *>(dfa) + idx);
+    const cfg *get(const cfg *base, const int32_t idx) const {
+        return reinterpret_cast<const cfg *>(reinterpret_cast<const uint8_t *>(base) + idx);
     }
     int wordStartsBefore = 1000000000;
 };
 
 struct State {
-    uint32_t idx;
+    const cfg *lex;
 
     // used for making an unordered_set of const State*
     struct Hash {
         const LM &unused;
         size_t operator()(const State *v) const {
-            return std::hash<uint32_t>()(v->idx);
+            return std::hash<const void*>()(v->lex);
         }
     };
 
     struct Equality {
         const LM &unused;
         int operator()(const State *v1, const State *v2) const {
-            return v1->idx == v2->idx;
+            return v1->lex == v2->lex;
         }
     };
 
     // Iterate over labels, calling fn with: the new State, the label index and the lm score
     template <typename Fn>
     void forLabels(const LM &lm, Fn&& fn) const {
-        auto &lex = *lm.get(idx);
         const float commandScore = 1.5;
-        if (lex.token == 0) { // word boundary at sil token
-            fn(*this, idx, commandScore);
+        if (lex->token == 0) { // word boundary at sil token
+            fn(*this, reinterpret_cast<const uint8_t*>(lex) - reinterpret_cast<const uint8_t*>(lm.dfa), commandScore);
         }
     }
 
@@ -413,13 +412,12 @@ struct State {
     // new State, new token index and whether the new state has children
     template <typename Fn>
     void forChildren(int frame, const LM &lm, Fn&& fn) const {
-        auto &lex = *lm.get(idx);
-        if (lex.token == 0 && frame >= lm.wordStartsBefore)
+        if (lex->token == 0 && frame >= lm.wordStartsBefore)
             return;
-        for (int i = 0; i < lex.nEdges; ++i) {
-            auto nidx = lex.edges[i];
-            auto &nlex = *lm.get(nidx);
-            fn(State{nidx}, nlex.token, nlex.token != 0);
+        for (int i = 0; i < lex->nEdges; ++i) {
+            auto nidx = lex->edges[i];
+            auto nlex = lm.get(lex, nidx);
+            fn(State{nlex}, nlex->token, nlex->token != 0);
         }
     }
 
@@ -597,7 +595,7 @@ char *w2l_decoder_dfa(w2l_engine *engine, w2l_decoder *decoder, w2l_emission *em
                 transitions};
 
     DFALM::State commandState;
-    commandState.idx = 0; // presumed root state of dfa
+    commandState.lex = dfalm.dfa; // presumed root state of dfa
 
     std::vector<int> languageDecode; // stores tokens of a later language decode
 
@@ -716,9 +714,9 @@ char *w2l_decoder_dfa(w2l_engine *engine, w2l_decoder *decoder, w2l_emission *em
         // if we were decoding multiple commands in one go, the decoder would
         // update the state itself. Since we only do one command at a time,
         // we need to manually update the next start state.
-        commandState.idx = outWord;
+        commandState.lex = dfalm.get(dfalm.dfa, outWord);
 
-        const auto flags = dfalm.get(outWord)->flags;
+        const auto flags = commandState.lex->flags;
         if (flags & DFALM::FLAG_LM) {
             // do a language decode and store the results
             KenFlatTrieLM::State langStartState;
