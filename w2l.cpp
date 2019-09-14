@@ -598,6 +598,7 @@ char *w2l_decoder_dfa(w2l_engine *engine, w2l_decoder *decoder, w2l_emission *em
     commandState.lex = dfalm.dfa; // presumed root state of dfa
 
     std::vector<int> languageDecode; // stores tokens of a later language decode
+    int optLanguageWords = 0; // the number of optional language words that are still ok
 
     std::string result;
 
@@ -647,6 +648,9 @@ char *w2l_decoder_dfa(w2l_engine *engine, w2l_decoder *decoder, w2l_emission *em
 
         i = std::min(scoreWordEnd, N);
 
+        if (scoreWordStart == scoreWordEnd)
+            continue;
+
         // find the recognized word index
         int outWord = -1;
         // word decode is only written in first silence *after* the word
@@ -681,14 +685,26 @@ char *w2l_decoder_dfa(w2l_engine *engine, w2l_decoder *decoder, w2l_emission *em
 
         // While in language mode, emit language words up to the command
         if (!languageDecode.empty()) {
-            for (int j = viterbiSegStart; j < (goodCommand ? decodeWordStart : i); ++j) {
-                if (languageDecode[j] != -1) {
-                    if (!result.empty())
-                        result += " ";
-                    result += decoderObj->wordDict.getEntry(languageDecode[j]);
-                    if (opts.debug) {
-                        std::cout << "decoded language, new out: " << result << std::endl;
-                    }
+            // since the decode result is in the silence after the word,
+            // indexes are shifted by one
+            for (int j = viterbiSegStart + 1; j < std::min(goodCommand ? decodeWordStart : i + 1, N); ++j) {
+                if (languageDecode[j] == -1)
+                    continue;
+
+                auto word = decoderObj->wordDict.getEntry(languageDecode[j]);
+
+                if (optLanguageWords == 0) {
+                    if (opts.debug)
+                        std::cout << "seen word where command was expected: " << word << std::endl << std::endl;
+                    return nullptr;
+                }
+                optLanguageWords -= 1;
+
+                if (!result.empty())
+                    result += " ";
+                result += word;
+                if (opts.debug) {
+                    std::cout << "decoded language, new out: " << result << std::endl << std::endl;
                 }
             }
         }
@@ -700,11 +716,13 @@ char *w2l_decoder_dfa(w2l_engine *engine, w2l_decoder *decoder, w2l_emission *em
             result += "@"; // command marker
             result += tokensToStringDedup(decoderToks, decodeWordStart, decodeWordEnd);
             if (opts.debug) {
-                std::cout << "decoded command, new out: " << result << std::endl;
+                std::cout << "decoded command, new out: " << result << std::endl << std::endl;
             }
         } else {
             if (languageDecode.empty()) {
                 // found a non-command and language mode is off
+                if (opts.debug)
+                    std::cout << "seen non-command where command was expected" << std::endl << std::endl;
                 return nullptr;
             }
             // not a command but we can report whatever language we can find
@@ -718,6 +736,9 @@ char *w2l_decoder_dfa(w2l_engine *engine, w2l_decoder *decoder, w2l_emission *em
 
         const auto flags = commandState.lex->flags;
         if (flags & DFALM::FLAG_LM) {
+            // TODO: We may want different decoding (maybe even acoustic models) depending
+            // on whether what follows is a phrase or disjoint words.
+
             // do a language decode and store the results
             KenFlatTrieLM::State langStartState;
             langStartState.kenState = decoderObj->lm->start(0);
@@ -726,6 +747,33 @@ char *w2l_decoder_dfa(w2l_engine *engine, w2l_decoder *decoder, w2l_emission *em
             languageDecode = std::vector<int>(i, 0);
             languageDecode.insert(languageDecode.end(), languageResult.words.begin() + 1, languageResult.words.end());
             //std::cout << "lang decode: " << tokensToString(languageResult.tokens, 1, languageResult.tokens.size() - 1) << std::endl;
+
+            // The maximum number of language words that may follow
+            int languageMaxWords = std::numeric_limits<int>::max();
+
+            // The minimum number of language words - there's no command detecton during these
+            int languageMinWords = 0;
+            optLanguageWords = languageMaxWords - languageMinWords; // we'll detect the min words right now
+            for (; i < N && languageMinWords > 0; ++i) {
+                if (languageDecode[i] == -1)
+                    continue;
+
+                auto word = decoderObj->wordDict.getEntry(languageDecode[i]);
+                if (!result.empty())
+                    result += " ";
+                result += word;
+                if (opts.debug) {
+                    std::cout << "decoded language, new out: " << result << std::endl << std::endl;
+                }
+                languageMinWords -= 1;
+                if (languageMinWords == 0)
+                    break; // keep i on this silence and continue command decoding from there
+            }
+            if (i == N && languageMinWords > 0) {
+                std::cout << "not enough words followed language command" << std::endl << std::endl;
+                return nullptr;
+            }
+
         } else if (flags & DFALM::FLAG_TERM) {
             // TODO: Should reject everything if non-silence follows?
             break;
