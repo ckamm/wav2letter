@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <string>
 #include <typeinfo>
+#include <experimental/optional>
 
 #include <flashlight/flashlight.h>
 #include <gflags/gflags.h>
@@ -358,10 +359,11 @@ std::vector<uint8_t> charToToken(128);
 uint32_t EDGE_INIT[TOKENS] = {0};
 
 enum {
-    FLAG_NONE  = 0,
-    FLAG_START = 1,
-    FLAG_TERM  = 2,
-    FLAG_LM    = 4,
+    FLAG_NONE    = 0,
+    FLAG_START   = 1,
+    FLAG_TERM    = 2,
+    FLAG_WORD    = 4,
+    FLAG_LM_CTX  = 8,
 };
 
 struct LM {
@@ -412,11 +414,13 @@ struct State {
     // new State, new token index and whether the new state has children
     template <typename Fn>
     void forChildren(int frame, const LM &lm, Fn&& fn) const {
-        if (lex->token == 0 && frame >= lm.wordStartsBefore)
+        if ((lex->token == 0 || lex->token == 255) && frame >= lm.wordStartsBefore)
             return;
         for (int i = 0; i < lex->nEdges; ++i) {
             auto nidx = lex->edges[i];
             auto nlex = lm.get(lex, nidx);
+            if (nlex->token == 255)
+                continue;
             fn(State{nlex}, nlex->token, nlex->token != 0);
         }
     }
@@ -597,14 +601,17 @@ char *w2l_decoder_dfa(w2l_engine *engine, w2l_decoder *decoder, w2l_emission *em
     DFALM::State commandState;
     commandState.lex = dfalm.dfa; // presumed root state of dfa
 
-    std::vector<int> languageDecode; // stores tokens of a later language decode
-    int optLanguageWords = 0; // the number of optional language words that are still ok
+    std::vector<int> languageDecodeContext;
 
     std::string result;
 
+    if (opts.debug) {
+        std::cout << "detecting in viterbi toks: " << tokensToString(viterbiToks, 0, viterbiToks.size()) << std::endl;
+    }
+
     int i = 0;
     while (i < N) {
-        int viterbiSegStart = i;
+        int segStart = i;
         while (i < N && viterbiToks[i] == 0)
             ++i;
         int viterbiWordStart = i;
@@ -613,174 +620,243 @@ char *w2l_decoder_dfa(w2l_engine *engine, w2l_decoder *decoder, w2l_emission *em
         int viterbiWordEnd = i;
         // it's ok if wordStart == wordEnd, maybe the decoder sees something
 
-        // in the future we could stop the decode after one word instead of
-        // decoding everything
-        int decodeLen = N - viterbiSegStart;
-        commandDecoder.lm_.wordStartsBefore = viterbiWordEnd - viterbiSegStart;
-        auto decodeResult = commandDecoder.normal(emissionVec.data() + viterbiSegStart * T, decodeLen, T, commandState);
-        auto decoderToks = decodeResult.tokens;
-        decoderToks.erase(decoderToks.begin()); // initial hyp token
-        std::vector<int> startSil(viterbiSegStart, 0);
-        decoderToks.insert(decoderToks.begin(), startSil.begin(), startSil.end());
-        decodeLen += viterbiSegStart;
-
-        int j = 0;
-        while (j < decodeLen && decoderToks[j] == 0)
-            ++j;
-        int decodeWordStart = j;
-        while (j < decodeLen && decoderToks[j] != 0)
-            ++j;
-        int decodeWordEnd = j;
-        // Again it's ok if wordStart == wordEnd, need to process anyway.
-        // Maybe we are in language mode and need to emit those words?
-
-        // we score the decoded word plus any adjacent non-sil viterbi tokens
-        // - at least until the next decoded command word start
-        int scoreWordStart = std::min(viterbiWordStart, decodeWordStart);
-        int scoreWordEnd = decodeWordEnd;
-        while (scoreWordEnd < N && viterbiToks[scoreWordEnd] != 0 && decoderToks[scoreWordEnd] == 0)
-            ++scoreWordEnd;
-
-        // if the decoder didn't see anything, only discard the area where we allowed
-        // words to start.
-        if (decodeWordStart == decodeWordEnd)
-            scoreWordEnd = viterbiWordEnd;
-
-        i = std::min(scoreWordEnd, N);
-
-        if (scoreWordStart == scoreWordEnd)
-            continue;
-
-        // find the recognized word index
-        int outWord = -1;
-        // word decode is only written in first silence *after* the word
-        for (int j = scoreWordStart; j < std::max(decodeWordEnd + 1, scoreWordEnd); ++j) {
-            outWord = decodeResult.words[1 + j - viterbiSegStart]; // +1 because of initial hyp
-            if (outWord != -1)
-                break;
-        }
-
-        // the criterion for rejecting decodes is the decode-score / viterbi-score
-        // where the score is the emission-transmission score
-        float windowFrac = worstEmissionTransmissionWindowFraction(decoderToks, viterbiToks, scoreWordStart, scoreWordEnd, opts.rejectionTokenWindow);
-        bool goodCommand = windowFrac > opts.rejectionThreshold && outWord != -1;
-
         if (opts.debug) {
-            float viterbiScore = emissionTransmissionScore(viterbiToks, scoreWordStart, scoreWordEnd);
-            float decoderScore = emissionTransmissionScore(decoderToks, scoreWordStart, scoreWordEnd);
-
-            if (outWord == -1) {
-                std::cout << "no command" << std::endl;
-            } else if (goodCommand) {
-                std::cout << "good command" << std::endl;
-            } else {
-                std::cout << "rejected command" << std::endl;
-            }
-            std::cout << "decoder: " << tokensToString(decoderToks, scoreWordStart, scoreWordEnd) << std::endl
-                      << "viterbi: " << tokensToString(viterbiToks, scoreWordStart, scoreWordEnd) << std::endl
-                      << "scores: decoder: " << decoderScore << " viterbi: " << viterbiScore << " fraction: " << decoderScore / viterbiScore << std::endl
-                      << "        worst window fraction: " << windowFrac << std::endl
-                      << std::endl;
+            std::cout << "  segment viterbi toks: " << tokensToString(viterbiToks, segStart, viterbiWordEnd) << std::endl;
         }
 
-        // While in language mode, emit language words up to the command
-        if (!languageDecode.empty()) {
-            // since the decode result is in the silence after the word,
-            // indexes are shifted by one
-            for (int j = viterbiSegStart + 1; j < std::min(goodCommand ? decodeWordStart : i + 1, N); ++j) {
-                if (languageDecode[j] == -1)
-                    continue;
+        struct LanguageCandidate {
+            int endFrame;
+            int wordLabel;
+            const cfg *next;
+            float score;
+            std::vector<int> contextDecode;
+        };
+        std::vector<LanguageCandidate> languageCandidates;
 
-                auto word = decoderObj->wordDict.getEntry(languageDecode[j]);
+        struct CommandCandidate {
+            int startFrame;
+            int endFrame;
+            std::string text;
+            const cfg *next;
+        };
+        std::experimental::optional<CommandCandidate> commandCandidate;
 
-                if (optLanguageWords == 0) {
-                    if (opts.debug)
-                        std::cout << "seen word where command was expected: " << word << std::endl << std::endl;
-                    return nullptr;
-                }
-                optLanguageWords -= 1;
+        //
+        // Mini beam-search: Prepare language and command candidates
+        //
 
-                if (!result.empty())
-                    result += " ";
-                result += word;
-                if (opts.debug) {
-                    std::cout << "decoded language, new out: " << result << std::endl << std::endl;
-                }
+        // Deal with any language-mode children now.
+        const cfg *lang = nullptr;
+        bool allowsCommand = false;
+        for (int edge = 0; edge < commandState.lex->nEdges; ++edge) {
+            const cfg *child = dfalm.get(commandState.lex, commandState.lex->edges[edge]);
+            if (child->token != 255) {
+                allowsCommand = true;
+                continue;
             }
-        }
 
-        // If a command was found, output it.
-        if (goodCommand) {
-            if (!result.empty())
-                result += " ";
-            result += "@"; // command marker
-            result += tokensToStringDedup(decoderToks, decodeWordStart, decodeWordEnd);
-            if (opts.debug) {
-                std::cout << "decoded command, new out: " << result << std::endl << std::endl;
-            }
-        } else {
-            if (languageDecode.empty()) {
-                // found a non-command and language mode is off
-                if (opts.debug)
-                    std::cout << "seen non-command where command was expected" << std::endl << std::endl;
-                return nullptr;
-            }
-            // not a command but we can report whatever language we can find
-            continue;
-        }
-
-        // if we were decoding multiple commands in one go, the decoder would
-        // update the state itself. Since we only do one command at a time,
-        // we need to manually update the next start state.
-        commandState.lex = dfalm.get(dfalm.dfa, outWord);
-
-        const auto flags = commandState.lex->flags;
-        if (flags & DFALM::FLAG_LM) {
             // TODO: We may want different decoding (maybe even acoustic models) depending
             // on whether what follows is a phrase or disjoint words.
 
-            // do a language decode and store the results
-            KenFlatTrieLM::State langStartState;
-            langStartState.kenState = decoderObj->lm->start(0);
-            langStartState.lex = decoderObj->flatTrie->getRoot();
-            auto languageResult = decoderObj->decoder->normal(emissionVec.data() + i * T, N - i, T, langStartState);
-            languageDecode = std::vector<int>(i, 0);
-            languageDecode.insert(languageDecode.end(), languageResult.words.begin() + 1, languageResult.words.end());
-            //std::cout << "lang decode: " << tokensToString(languageResult.tokens, 1, languageResult.tokens.size() - 1) << std::endl;
-
-            // The maximum number of language words that may follow
-            int languageMaxWords = std::numeric_limits<int>::max();
-
-            // The minimum number of language words - there's no command detecton during these
-            int languageMinWords = 0;
-            optLanguageWords = languageMaxWords - languageMinWords; // we'll detect the min words right now
-            for (; i < N && languageMinWords > 0; ++i) {
-                if (languageDecode[i] == -1)
-                    continue;
-
-                auto word = decoderObj->wordDict.getEntry(languageDecode[i]);
-                if (!result.empty())
-                    result += " ";
-                result += word;
-                if (opts.debug) {
-                    std::cout << "decoded language, new out: " << result << std::endl << std::endl;
-                }
-                languageMinWords -= 1;
-                if (languageMinWords == 0)
-                    break; // keep i on this silence and continue command decoding from there
-            }
-            if (i == N && languageMinWords > 0) {
-                std::cout << "not enough words followed language command" << std::endl << std::endl;
-                return nullptr;
+            std::vector<int> decode;
+            if ((child->flags & DFALM::FLAG_LM_CTX) && !languageDecodeContext.empty()) {
+                decode = languageDecodeContext;
+            } else {
+                KenFlatTrieLM::State langStartState;
+                langStartState.kenState = decoderObj->lm->start(0);
+                langStartState.lex = decoderObj->flatTrie->getRoot();
+                auto languageResult = decoderObj->decoder->normal(emissionVec.data() + segStart * T, N - segStart, T, langStartState);
+                decode = std::move(languageResult.words);
             }
 
-        } else if (flags & DFALM::FLAG_TERM) {
-            // TODO: Should reject everything if non-silence follows?
-            break;
-        } else {
-            languageDecode.clear();
+            // Find the first decode result
+            int langWordEnd = 1;
+            while (langWordEnd < decode.size() && decode[langWordEnd] == -1)
+                ++langWordEnd;
+            if (langWordEnd == decode.size())
+                continue;
+
+            int endTok = segStart + langWordEnd - 1; // -1 because decode has an initial hyp in [0]
+
+            // Due to negative silweight in the language decoder it's often the case
+            // that the decode ends but viterbi toks still run on. Allow consuming
+            // repeated tokens until the next silence.
+            int vitEnd = endTok;
+            while (vitEnd < N && viterbiToks[vitEnd] != 0 && viterbiToks[vitEnd] == viterbiToks[endTok])
+                ++vitEnd;
+            // If the next token isn't a silence... oops
+            if (vitEnd < N && viterbiToks[vitEnd] != 0)
+                vitEnd = endTok;
+
+            if (opts.debug) {
+                std::cout << "    lang candidate:" << std::endl
+                          << "        word: " << decoderObj->wordDict.getEntry(decode[langWordEnd]) << std::endl
+                          << "       vtoks: " << tokensToString(viterbiToks, segStart, vitEnd) << std::endl;
+            }
+
+            // TODO: To support interjecting command words we shouldn't save the actual decode,
+            // but the beam search state. We do however want to do the whole phrase decode
+            // in one go where possible because the second decoded word can influence the first.
+            // A mixed approach where the beam is collapsed when seeing a command word,
+            // but the kenlm language state is nevertheless retained seems easiest. And much more
+            // complex arrangements are possible.
+            auto contextDecode = std::vector<int>(decode.begin() + langWordEnd + 1, decode.end());
+
+            languageCandidates.push_back(LanguageCandidate{
+                vitEnd,
+                decode[langWordEnd],
+                child,
+                0,
+                contextDecode
+            });
         }
+
+        [&]() {
+            if (!allowsCommand)
+                return;
+
+            // in the future we could stop the decode after one word instead of
+            // decoding everything
+            int decodeLen = N - segStart;
+            commandDecoder.lm_.wordStartsBefore = viterbiWordEnd - segStart;
+            auto decodeResult = commandDecoder.normal(emissionVec.data() + segStart * T, decodeLen, T, commandState);
+            auto decoderToks = decodeResult.tokens;
+            decoderToks.erase(decoderToks.begin()); // initial hyp token
+            std::vector<int> startSil(segStart, 0);
+            decoderToks.insert(decoderToks.begin(), startSil.begin(), startSil.end());
+            decodeLen += segStart;
+
+            int j = 0;
+            while (j < decodeLen && decoderToks[j] == 0)
+                ++j;
+            int decodeWordStart = j;
+            while (j < decodeLen && decoderToks[j] != 0)
+                ++j;
+            int decodeWordEnd = j;
+            // Again it's ok if wordStart == wordEnd, need to process anyway.
+            // Maybe we are in language mode and need to emit those words?
+
+            // we score the decoded word plus any adjacent non-sil viterbi tokens
+            // - at least until the next decoded command word start
+            int scoreWordStart = std::min(viterbiWordStart, decodeWordStart);
+            int scoreWordEnd = decodeWordEnd;
+            while (scoreWordEnd < N && viterbiToks[scoreWordEnd] != 0 && decoderToks[scoreWordEnd] == 0)
+                ++scoreWordEnd;
+
+            // if the decoder didn't see anything but viterbi saw something, there's no command
+            if (decodeWordStart == decodeWordEnd) {
+                return;
+            }
+
+            // find the recognized word index
+            int outWord = -1;
+            // word decode is only written in first silence *after* the word
+            for (int j = scoreWordStart; j < std::max(decodeWordEnd + 1, scoreWordEnd); ++j) {
+                outWord = decodeResult.words[1 + j - segStart]; // +1 because of initial hyp
+                if (outWord != -1)
+                    break;
+            }
+
+            // the criterion for rejecting decodes is the decode-score / viterbi-score
+            // where the score is the emission-transmission score
+            float windowFrac = worstEmissionTransmissionWindowFraction(decoderToks, viterbiToks, scoreWordStart, scoreWordEnd, opts.rejectionTokenWindow);
+            bool goodCommand = windowFrac > opts.rejectionThreshold && outWord != -1;
+
+            if (opts.debug) {
+                float viterbiScore = emissionTransmissionScore(viterbiToks, scoreWordStart, scoreWordEnd);
+                float decoderScore = emissionTransmissionScore(decoderToks, scoreWordStart, scoreWordEnd);
+
+                if (outWord == -1) {
+                    std::cout << "    no command" << std::endl;
+                } else if (goodCommand) {
+                    std::cout << "    good command" << std::endl;
+                } else {
+                    std::cout << "    rejected command" << std::endl;
+                }
+                std::cout << "       decoder: " << tokensToString(decoderToks, scoreWordStart, scoreWordEnd) << std::endl
+                          << "       viterbi: " << tokensToString(viterbiToks, scoreWordStart, scoreWordEnd) << std::endl
+                          << "       scores: decoder: " << decoderScore << " viterbi: " << viterbiScore << " fraction: " << decoderScore / viterbiScore << std::endl
+                          << "               worst window fraction: " << windowFrac << std::endl;
+            }
+
+            if (!goodCommand) {
+                return;
+            }
+
+            // Mark as good command
+            commandCandidate = CommandCandidate{
+                decodeWordStart, scoreWordEnd,
+                tokensToStringDedup(decoderToks, decodeWordStart, decodeWordEnd),
+                dfalm.get(dfalm.dfa, outWord)
+            };
+        }();
+
+        auto appendResult = [&](const std::string &str, bool command = false) {
+            if (!result.empty())
+                result += " ";
+            if (command)
+                result += "@";
+            result += str;
+        };
+
+        //
+        // Choose between the language and command candidates
+        //
+        const cfg *next = nullptr;
+
+        // First consider language words that end before the command starts
+        for (const auto &langCandidate : languageCandidates) {
+            if (commandCandidate && langCandidate.endFrame >= commandCandidate->startFrame)
+                continue;
+
+            // ### use score
+            appendResult(decoderObj->wordDict.getEntry(langCandidate.wordLabel));
+            next = langCandidate.next;
+            i = langCandidate.endFrame;
+            languageDecodeContext = langCandidate.contextDecode;
+            break;
+        }
+
+        // It's a command - if one was detected
+        if (!next && commandCandidate) {
+            appendResult(commandCandidate->text, true);
+            next = commandCandidate->next;
+            i = commandCandidate->endFrame;
+            languageDecodeContext.clear();
+        }
+
+        // Otherwise go to language after all
+        if (!next) {
+            for (const auto &langCandidate : languageCandidates) {
+                // ### use score
+                appendResult(decoderObj->wordDict.getEntry(langCandidate.wordLabel));
+                next = langCandidate.next;
+                i = langCandidate.endFrame;
+                languageDecodeContext = langCandidate.contextDecode;
+                break;
+            }
+        }
+
+        // No matching candidates
+        if (!next) {
+            // Trailing silence detects as nothing
+            if (viterbiWordStart == viterbiWordEnd && viterbiWordEnd == N)
+                break;
+            // Otherwise there was something and we fail detection
+            return nullptr;
+        }
+
+        if (opts.debug)
+            std::cout << "    result: " << result << std::endl;
+
+        commandState.lex = next;
+        if (next->flags & DFALM::FLAG_TERM)
+            break;
     }
+
+    if (opts.debug)
+        std::cout << "  result: " << result << std::endl << std::endl;
+
     if (!result.empty())
         return strdup(result.c_str());
     return nullptr;
