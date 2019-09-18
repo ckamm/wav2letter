@@ -360,10 +360,12 @@ uint32_t EDGE_INIT[TOKENS] = {0};
 
 enum {
     FLAG_NONE    = 0,
-    FLAG_START   = 1,
-    FLAG_TERM    = 2,
-    FLAG_WORD    = 4,
-    FLAG_LM_CTX  = 8,
+    FLAG_TERM    = 1,
+};
+
+enum {
+    TOKEN_LMWORD     = 255,
+    TOKEN_LMWORD_CTX = 254,
 };
 
 struct LM {
@@ -371,24 +373,28 @@ struct LM {
     const cfg *get(const cfg *base, const int32_t idx) const {
         return reinterpret_cast<const cfg *>(reinterpret_cast<const uint8_t *>(base) + idx);
     }
+    static const cfg_edge *getEdge(const cfg *base, int edge) {
+        return reinterpret_cast<const cfg_edge *>(&base->edges[5 * edge]);
+    }
     int wordStartsBefore = 1000000000;
 };
 
 struct State {
-    const cfg *lex;
+    const cfg *lex = nullptr;
+    bool wordEnd = false;
 
     // used for making an unordered_set of const State*
     struct Hash {
         const LM &unused;
         size_t operator()(const State *v) const {
-            return std::hash<const void*>()(v->lex);
+            return std::hash<const void*>()(v->lex) ^ v->wordEnd;
         }
     };
 
     struct Equality {
         const LM &unused;
         int operator()(const State *v1, const State *v2) const {
-            return v1->lex == v2->lex;
+            return v1->lex == v2->lex && v1->wordEnd == v2->wordEnd;
         }
     };
 
@@ -396,7 +402,7 @@ struct State {
     template <typename Fn>
     void forLabels(const LM &lm, Fn&& fn) const {
         const float commandScore = 1.5;
-        if (lex->token == 0) { // word boundary at sil token
+        if (wordEnd) {
             fn(*this, reinterpret_cast<const uint8_t*>(lex) - reinterpret_cast<const uint8_t*>(lm.dfa), commandScore);
         }
     }
@@ -414,14 +420,14 @@ struct State {
     // new State, new token index and whether the new state has children
     template <typename Fn>
     void forChildren(int frame, const LM &lm, Fn&& fn) const {
-        if ((lex->token == 0 || lex->token == 255) && frame >= lm.wordStartsBefore)
+        if (wordEnd && frame >= lm.wordStartsBefore)
             return;
         for (int i = 0; i < lex->nEdges; ++i) {
-            auto nidx = lex->edges[i];
-            auto nlex = lm.get(lex, nidx);
-            if (nlex->token == 255)
+            auto edge = LM::getEdge(lex, i);
+            auto nlex = lm.get(lex, edge->offset);
+            if (edge->token == TOKEN_LMWORD || edge->token == TOKEN_LMWORD_CTX)
                 continue;
-            fn(State{nlex}, nlex->token, nlex->token != 0);
+            fn(State{nlex, edge->token == 0}, edge->token, edge->token != 0);
         }
     }
 
@@ -649,8 +655,9 @@ char *w2l_decoder_dfa(w2l_engine *engine, w2l_decoder *decoder, w2l_emission *em
         const cfg *lang = nullptr;
         bool allowsCommand = false;
         for (int edge = 0; edge < commandState.lex->nEdges; ++edge) {
-            const cfg *child = dfalm.get(commandState.lex, commandState.lex->edges[edge]);
-            if (child->token != 255) {
+            auto edgeInfo = DFALM::LM::getEdge(commandState.lex, edge);
+            const cfg *child = dfalm.get(commandState.lex, edgeInfo->offset);
+            if (edgeInfo->token != DFALM::TOKEN_LMWORD && edgeInfo->token != DFALM::TOKEN_LMWORD_CTX) {
                 allowsCommand = true;
                 continue;
             }
@@ -659,7 +666,7 @@ char *w2l_decoder_dfa(w2l_engine *engine, w2l_decoder *decoder, w2l_emission *em
             // on whether what follows is a phrase or disjoint words.
 
             std::vector<int> decode;
-            if ((child->flags & DFALM::FLAG_LM_CTX) && !languageDecodeContext.empty()) {
+            if (edgeInfo->token == DFALM::TOKEN_LMWORD_CTX && !languageDecodeContext.empty()) {
                 decode = languageDecodeContext;
             } else {
                 KenFlatTrieLM::State langStartState;
@@ -719,11 +726,13 @@ char *w2l_decoder_dfa(w2l_engine *engine, w2l_decoder *decoder, w2l_emission *em
             // decoding everything
             int decodeLen = N - segStart;
             commandDecoder.lm_.wordStartsBefore = viterbiWordEnd - segStart;
+            commandState.wordEnd = true;
             auto decodeResult = commandDecoder.normal(emissionVec.data() + segStart * T, decodeLen, T, commandState);
             auto decoderToks = decodeResult.tokens;
             decoderToks.erase(decoderToks.begin()); // initial hyp token
             std::vector<int> startSil(segStart, 0);
             decoderToks.insert(decoderToks.begin(), startSil.begin(), startSil.end());
+            std::cout << tokensToString(decoderToks, 0, N) << std::endl;
             decodeLen += segStart;
 
             int j = 0;
@@ -850,8 +859,10 @@ char *w2l_decoder_dfa(w2l_engine *engine, w2l_decoder *decoder, w2l_emission *em
             std::cout << "    result: " << result << std::endl;
 
         commandState.lex = next;
-        if (next->flags & DFALM::FLAG_TERM)
-            break;
+        // ### Fix END handling
+        //if (next->flags & DFALM::FLAG_TERM)
+        //    break;
+
     }
 
     if (opts.debug)

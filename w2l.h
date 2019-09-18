@@ -45,12 +45,18 @@ char *w2l_decoder_result_tokens(w2l_decoder *decoder, w2l_decoderesult *decodere
 void w2l_decoderesult_free(w2l_decoderesult *decoderesult);
 void w2l_decoder_free(w2l_decoder *decoder);
 
+#pragma pack(1)
+typedef struct {
+    uint8_t token;
+    int32_t offset;
+} cfg_edge;
+
 typedef struct {
     uint8_t flags;
-    uint8_t token;
     uint8_t nEdges;
-    int32_t edges[1];
+    uint8_t edges[0];
 } cfg;
+#pragma pack()
 
 typedef struct {
     w2l_decode_options cmdDecodeOpts; // silweight of around 0.5 was required for me
