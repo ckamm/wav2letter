@@ -54,7 +54,7 @@ typedef struct {
 typedef struct {
     uint8_t flags;
     uint8_t nEdges;
-    uint8_t edges[0];
+    cfg_edge edges[0];
 } cfg;
 #pragma pack()
 
