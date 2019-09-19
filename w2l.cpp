@@ -42,12 +42,13 @@ public:
 
 class Emission {
 public:
-    Emission(fl::Variable emission) {
+    Emission(EngineBase *engine, fl::Variable emission) {
+        this->engine = engine;
         this->emission = emission;
     }
     ~Emission() {}
 
-    char *text(EngineBase *engine) {
+    char *text() {
         auto tokenPrediction =
             afToVector<int>(engine->criterion->viterbiPath(emission.array()));
         auto letters = tknPrediction2Ltr(tokenPrediction, engine->tokenDict);
@@ -59,6 +60,7 @@ public:
         return strdup("");
     }
 
+    EngineBase *engine;
     fl::Variable emission;
 };
 
@@ -87,7 +89,7 @@ public:
         auto feat = featurize({data}, {});
         auto input = af::array(feat.inputDims, feat.input.data());
         auto rawEmission = network->forward({fl::input(input)}).front();
-        return new Emission(rawEmission);
+        return new Emission(this, rawEmission);
     }
 
     bool exportModel(const char *path) {
@@ -462,8 +464,8 @@ void w2l_engine_free(w2l_engine *engine) {
         delete reinterpret_cast<Engine *>(engine);
 }
 
-char *w2l_emission_text(w2l_engine *engine, w2l_emission *emission) {
-    return reinterpret_cast<Emission *>(emission)->text(reinterpret_cast<Engine *>(engine));
+char *w2l_emission_text(w2l_emission *emission) {
+    return reinterpret_cast<Emission *>(emission)->text();
 }
 
 float *w2l_emission_values(w2l_emission *emission, int *frames, int *tokens) {
