@@ -849,26 +849,36 @@ char *w2l_decoder_dfa(w2l_engine *engine, w2l_decoder *decoder, w2l_emission *em
             // Trailing silence detects as nothing
             if (viterbiWordStart == viterbiWordEnd && viterbiWordEnd == N)
                 break;
+
             // Otherwise there was something and we fail detection
+            if (opts.debug) {
+                std::cout << "    no decode candidates, aborting" << std::endl;
+                std::cout << "  discarding: " << result << std::endl << std::endl;
+            }
             return nullptr;
         }
 
         if (opts.debug)
-            std::cout << "    result: " << result << std::endl;
+            std::cout << "    after: " << result << std::endl;
 
         commandState.lex = next;
-        // ### Fix END handling
-        //if (next->flags & DFALM::FLAG_TERM)
-        //    break;
+    }
 
+    // Common case: only silence
+    if (result.empty())
+        return nullptr;
+
+    if (!(commandState.lex->flags & DFALM::FLAG_TERM)) {
+        if (opts.debug) {
+            std::cout << "  ended in non-terminal" << std::endl;
+            std::cout << "  discarding: " << result << std::endl << std::endl;
+        }
+        return nullptr;
     }
 
     if (opts.debug)
         std::cout << "  result: " << result << std::endl << std::endl;
-
-    if (!result.empty())
-        return strdup(result.c_str());
-    return nullptr;
+    return strdup(result.c_str());
 }
 
 } // extern "C"
