@@ -821,7 +821,7 @@ char *w2l_decoder_dfa(w2l_engine *engine, w2l_decoder *decoder, w2l_emission *em
                     std::cout << "    no decode candidates, and more follows" << std::endl;
                     std::cout << "    discarding: " << hyp.text << std::endl;
                 }
-            } else {
+            } else if (!hyp.text.empty()) {
                 if (opts.debug) {
                     std::cout << "    accepted end score: " << hyp.score << std::endl;
                     std::cout << "        text: " << hyp.text << std::endl;
@@ -834,8 +834,6 @@ char *w2l_decoder_dfa(w2l_engine *engine, w2l_decoder *decoder, w2l_emission *em
     // Sort ends by score and return the best one
     std::sort(ends.begin(), ends.end(), [](const auto &l, const auto &r) { return l.score > r.score; });
     for (const auto &end : ends) {
-        if (end.text.empty())
-            continue;
         if (opts.debug)
             std::cout << "  result: " << end.text << std::endl << std::endl;
         return strdup(end.text.c_str());
