@@ -120,6 +120,7 @@ add_library(w2l SHARED
     ${LIBRARIES_SRC}
     ${LM_SRC}
     w2l.cpp
+    w2l_forward.cpp
 )
 
 if (USE_MKL)

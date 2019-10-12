@@ -53,26 +53,23 @@ typedef struct {
 #pragma pack()
 
 typedef struct {
-    /** Decoder options for commands. Language options are in decoder object.
+    /** Score for successfully decoded commands.
      *
-     * silweight of around 0.5 was helpful for me.
+     * Competes with language wordscore.
      */
-    w2l_decode_options command_decoder_opts;
+    float command_score;
 
-    /** Threshold for command rejection.
+    /** Threshold for rejection.
      *
-     * The emission-transmission score of potential decoded commands is divided by
-     * the score of the viterbi path. If the fraction is below this threshold
-     * the command will be rejected.
+     * The emission-transmission score of rejection_window_frame adjacent tokens
+     * divided by the score of the same area in the viterbi path. If the fraction
+     * is below this threshold the decode will be rejected.
      *
-     * Values around 0.85 work ok.
+     * Values around 0.55 work ok.
      */
     float rejection_threshold;
 
-    /** Window size for command vs viterbi comparison.
-     *
-     * Number of frames to use for the command score vs viterbi path score
-     * comparison.
+    /** Window size for decode vs viterbi comparison.
      *
      * Values around 8 make sense.
      */
