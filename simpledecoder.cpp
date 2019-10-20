@@ -591,7 +591,7 @@ auto SimpleDecoder<LM, LMStateType>::groupThreading(
 
             #pragma omp for
             for (size_t group = 0; group < n_groups; ++group) {
-                auto subResult = beamSearch.run(emissions, t, steps, rangeAdapter(*startHyp, group, n_groups));
+                auto subResult = beamSearch.run(emissions, t, steps, rangeAdapter(*startHyp, group, n_groups), hooks);
 
                 #pragma omp critical
                 {
