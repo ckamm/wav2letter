@@ -10,10 +10,65 @@ typedef struct w2l_decoderesult w2l_decoderesult;
 typedef struct w2l_emission w2l_emission;
 
 typedef struct {
-    int beamsize;
-    float beamthresh;
-    float lmweight;
-    float wordscore;
+    /** Number of beams to preserve after each step of beamsearch */
+    int beam_size;
+
+    /** Cut off all beams with a score this far from the best beam after each step */
+    float beam_threshold;
+
+    /** Scale for adjusting effect of LM scores */
+    float lm_weight;
+
+    /** Bonus score for decoding a LM word */
+    float word_score;
+
+    /** Score for successfully decoded commands.
+     *
+     * Competes with word_score.
+     */
+    float command_score;
+
+    /** Threshold for rejection.
+     *
+     * The emission-transmission score of rejection_window_frame adjacent tokens
+     * divided by the score of the same area in the viterbi path. If the fraction
+     * is below this threshold the decode will be rejected.
+     *
+     * Values around 0.55 work ok.
+     */
+    float rejection_threshold;
+
+    /** Window size for decode vs viterbi comparison.
+     *
+     * Values around 8 make sense.
+     */
+    int rejection_window_frames;
+
+    /** Number of threads to use during beam search.
+     *
+     * Note that threading does change the algorithm and thus affects
+     * the results.
+     */
+    int n_threads;
+
+    /** Number of steps each thread performs before joining with the others again.
+     *
+     * Has no effect for n_threads=1.
+     */
+    int thread_independent_steps;
+
+    /** beam_size to use for independent threads.
+     *
+     * The idea is that they can get away with a reduced beam size because they
+     * start with a fraction of the starting hyps.
+     *
+     * If thread_beam_size==beam_size threading provides little benefit.
+     */
+    int thread_beam_size;
+
+    /** Whether to print debug messages to stdout. */
+    bool debug;
+
     float unkweight;
     bool logadd;
     float silweight;
@@ -52,33 +107,6 @@ typedef struct {
 } w2l_dfa_node;
 #pragma pack()
 
-typedef struct {
-    /** Score for successfully decoded commands.
-     *
-     * Competes with language wordscore.
-     */
-    float command_score;
-
-    /** Threshold for rejection.
-     *
-     * The emission-transmission score of rejection_window_frame adjacent tokens
-     * divided by the score of the same area in the viterbi path. If the fraction
-     * is below this threshold the decode will be rejected.
-     *
-     * Values around 0.55 work ok.
-     */
-    float rejection_threshold;
-
-    /** Window size for decode vs viterbi comparison.
-     *
-     * Values around 8 make sense.
-     */
-    int rejection_window_frames;
-
-    /** Whether to print debug messages to stdout. */
-    bool debug;
-} w2l_dfa_decode_options;
-
 /** Decode emisssions according to dfa model, return decoded text.
  *
  * If the decode fails or no good paths exist the result will be NULL.
@@ -87,7 +115,7 @@ typedef struct {
  * The dfa argument points to the first w2l_dfa_node. It is expected that
  * its address and edge offsets can be used to traverse the full dfa.
  */
-char *w2l_decoder_dfa(w2l_engine *engine, w2l_decoder *decoder, w2l_emission *emission, w2l_dfa_node *dfa, w2l_dfa_decode_options *opts);
+char *w2l_decoder_dfa(w2l_engine *engine, w2l_decoder *decoder, w2l_emission *emission, w2l_dfa_node *dfa);
 
 #ifdef __cplusplus
 } // extern "C"

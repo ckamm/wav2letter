@@ -35,10 +35,16 @@ std::vector<T> afToVector(const af::array& arr) {
 }
 
 w2l_decode_options w2l_decode_defaults {
-    2500,
+    200,
     25,
     1.0,
     1.0,
+    0.55,
+    8,
+    1,
+    5,
+    70,
+    false,
     -INFINITY,
     false,
     0.0,
@@ -48,10 +54,10 @@ using namespace w2l;
 
 DecoderOptions toW2lDecoderOptions(const w2l_decode_options &opts) {
     return DecoderOptions(
-                opts.beamsize,
-                opts.beamthresh,
-                opts.lmweight,
-                opts.wordscore,
+                opts.beam_size,
+                opts.beam_threshold,
+                opts.lm_weight,
+                opts.word_score,
                 opts.unkweight,
                 opts.logadd,
                 opts.silweight,
@@ -75,6 +81,8 @@ std::vector<std::string> loadWordList(const char *path) {
 class WrapDecoder {
 public:
     WrapDecoder(Engine *engine, const char *languageModelPath, const char *lexiconPath, const char *flattriePath, const w2l_decode_options *opts) {
+        this->opts = *opts;
+
         tokenDict = engine->tokenDict;
         silIdx = tokenDict.getIndex(kSilToken);
 
@@ -161,6 +169,7 @@ public:
     std::unique_ptr<SimpleDecoder<KenFlatTrieLM::LM, KenFlatTrieLM::State>> decoder;
     std::vector<std::string> wordList;
     Dictionary tokenDict;
+    w2l_decode_options opts;
     DecoderOptions decoderOpt;
     int silIdx;
     int unkLabel = 0;
@@ -449,11 +458,12 @@ void w2l_decoder_free(w2l_decoder *decoder) {
         delete reinterpret_cast<WrapDecoder *>(decoder);
 }
 
-char *w2l_decoder_dfa(w2l_engine *engine, w2l_decoder *decoder, w2l_emission *emission, w2l_dfa_node *dfa, w2l_dfa_decode_options *opts) {
+char *w2l_decoder_dfa(w2l_engine *engine, w2l_decoder *decoder, w2l_emission *emission, w2l_dfa_node *dfa) {
     auto engineObj = reinterpret_cast<Engine *>(engine);
     auto decoderObj = reinterpret_cast<WrapDecoder *>(decoder);
     auto emissionObj = reinterpret_cast<Emission *>(emission);
     auto rawEmission = emissionObj->emission;
+    auto *opts = &decoderObj->opts;
 
     auto emissionVec = afToVector<float>(rawEmission);
     int T = rawEmission.dims(0);
@@ -536,14 +546,10 @@ char *w2l_decoder_dfa(w2l_engine *engine, w2l_decoder *decoder, w2l_emission *em
     startStates.emplace_back(commandState, nullptr, 0.0, 0, -1);
 
     auto unfinishedBeams = [&]() {
-        const auto parallelBeamsearch = false;
-        if (!parallelBeamsearch)
+        if (opts->n_threads == 1)
             return commandDecoder.normalAll(emissionVec.data(), decodeLen, T, startStates, rejecter);
-
-        int nThreads = 4;
-        int stepsPerFanout = 5;
-        int threadBeamSize = commandDecoder.opt_.beamSize / nThreads;
-        return commandDecoder.groupThreading(emissionVec.data(), decodeLen, T, startStates, rejecter, nThreads, stepsPerFanout, threadBeamSize);
+        return commandDecoder.groupThreading(emissionVec.data(), decodeLen, T, startStates, rejecter,
+                                             opts->n_threads, opts->thread_independent_steps, opts->thread_beam_size);
     }();
 
     // Finishing kills beams that end in the middle of a word, or
